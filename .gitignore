@@ -12,6 +12,5 @@
 *.swp
 *.swo
 
-# dir
-thttpd-2.26
-answers
+tags
+
