@@ -1,0 +1,17 @@
+# Python
+*.py[cod]
+*.so
+*.egg
+*.egg-info
+
+# binary
+*.out
+*.o
+
+# vim
+*.swp
+*.swo
+
+# dir
+thttpd-2.26
+answers
