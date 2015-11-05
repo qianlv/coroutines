@@ -3,11 +3,17 @@
 import select
 import types
 import sys
+import os
 import socket
+import errno
+from itertools import chain
 from Queue import Queue
 
 
 class Task(object):
+    '''
+    A Simple Task object.
+    '''
     taskid = 0
 
     def __init__(self, target):
@@ -25,6 +31,9 @@ class Task(object):
                     self.target.throw(*self.exc_info)
                 else:
                     result = self.target.send(self.sendval)
+                # print '----------------------'
+                # print self.target, '+', self.sendval, '+', repr(result)
+                # print '----------------------'
             except StopIteration:
                 if not self.stack:
                     raise
@@ -47,7 +56,6 @@ class Task(object):
                         return
                     self.sendval = result
                     self.target = self.stack.pop()
-
 
     def __str__(self):
         return 'Task {} {}'.format(self.tid, str(self.target))
@@ -72,13 +80,41 @@ class Scheduler(object):
 
     def iopoll(self, timeout):
         if self.read_waiting or self.write_waiting:
-            rlist, wlist, elist = select.select(self.read_waiting,
-                                                self.write_waiting,
-                                                [], timeout)
-            for fd in rlist:
-                self.schedule(self.read_waiting.pop(fd))
-            for fd in wlist:
-                self.schedule(self.write_waiting.pop(fd))
+            try:
+                rlist, wlist, elist = select.select(self.read_waiting,
+                                                    self.write_waiting,
+                                                    [], timeout)
+            except (TypeError, ValueError):
+                self._remove_bad_file_descriptors()
+            except (select.error, IOError) as err:
+                if err[0] == errno.EINTR:
+                    pass
+                elif err[0] == errno.EBADF:
+                    self._remove_bad_file_descriptors()
+                else:
+                    raise
+            else:
+                for fd in rlist:
+                    self.schedule(self.read_waiting.pop(fd))
+                for fd in wlist:
+                    self.schedule(self.write_waiting.pop(fd))
+
+    def _remove_bad_file_descriptors(self):
+        for fd in set(self.read_waiting):
+            try:
+                select.select([fd], [fd], [fd], 0)
+            except:
+                task = self.read_waiting.pop(fd)
+                task.exc_info = sys.exc_info()
+                self.schedule(task)
+
+        for fd in set(self.write_waiting):
+            try:
+                select.select([fd], [fd], [fd], 0)
+            except:
+                task = self.write_waiting.pop(fd)
+                task.exc_info = sys.exc_info()
+                self.schedule(task)
 
     def iotask(self):
         while True:
@@ -103,7 +139,6 @@ class Scheduler(object):
             task = self.ready.get()
             try:
                 result = task.run()
-                # print task, result
                 if isinstance(result, SystemCall):
                     result.task = task
                     result.sched = self
@@ -178,41 +213,95 @@ class WaitTask(SystemCall):
             self.sched.schedule(self.task)
 
 
+def _is_file_descriptor(fd):
+    return isinstance(fd, (int, long))
+
+
 class ReadWait(SystemCall):
-    def __init__(self, f):
-        self.f = f
+    def __init__(self, fd, timeout=None):
+        self.fd = fd if _is_file_descriptor(fd) else fd.fileno()
 
     def handle(self):
-        fd = self.f.fileno()
-        self.sched.waitforread(self.task, fd)
+        self.sched.waitforread(self.task, self.fd)
 
 
 class WriteWait(SystemCall):
-    def __init__(self, f):
-        self.f = f
+    def __init__(self, fd):
+        self.fd = fd if _is_file_descriptor(fd) else fd.fileno()
 
     def handle(self):
-        fd = self.f.fileno()
-        self.sched.waitforwrite(self.task, fd)
+        self.sched.waitforwrite(self.task, self.fd)
 
 
 class SocketCloseError(Exception):
     pass
 
 
-class Socket(object):
-    def __init__(self, sock):
-        self.sock = sock
-        self._buf = b''
-        self._closed = False
+class SocketListenError(Exception):
+    pass
 
+
+class Listener(object):
+    ''' A socket wrapper object for listening socket.'''
+    def __init__(self, host, port, queuesize=5):
+        self.host = host or None
+        self.port = port
+        self._closed = False
+        self.sock = self._listen(queuesize)
+        if self.sock is None:
+            raise SocketListenError()
+    
+    def _listen(self, queuesize):
+        ''' Get socket. '''
+        addrinfo = socket.getaddrinfo(
+            self.host,
+            self.port,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM
+        )
+        sock = None
+        for family, socketype, proto, _, sockaddr in addrinfo:
+            try:
+                sock = socket.socket(family, socketype, proto)
+                if hasattr(socket, 'AF_INET6') and family == socket.AF_INET6:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except socket.error:
+                continue
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(sockaddr)
+            except socket.error as err:
+                print "Bind Error {} {}".format(err.args[0], err.args[1])
+                sock.close()
+                sock = None
+            if sock:
+                break
+        if sock:
+            sock.listen(queuesize)
+        return sock
+    
     def accept(self):
-        """ Accept a new socket connection, Return a Socket Object. """
+        """ Accept a new socket connection, Return a Connection Object. """
         if self._closed:
             raise SocketCloseError()
         yield ReadWait(self.sock)
         client, addr = self.sock.accept()
-        yield Socket(client), addr
+        yield Connection(client, addr)
+
+    def close(self):
+        """ Immediately close the listening socket. """
+        self._closed = True
+        self.sock.close()
+
+
+class Connection(object):
+    ''' A socket wrapper object for connected socket.'''
+
+    def __init__(self, sock, addr=None):
+        self.sock = sock
+        self.addr = addr
+        self._buf = b''
+        self._closed = False
 
     def send(self, buffer):
         """ Sends data on socket, return the numbers of bytes successfully sent. """
@@ -233,10 +322,11 @@ class Socket(object):
             self.sock.sendall(buffer)
 
     def readline(self, terminator="\n", bufsize=1024):
-        if self._close:
+        ''' Read a line (delimited by terminator) from socket. '''
+        if self._closed:
             raise SocketCloseError()
         while True:
-            if terminated in self._buf:
+            if terminator in self._buf:
                 line, self._buf = self._buf.split(terminator, 1)
                 line += terminator
                 yield line
@@ -251,6 +341,7 @@ class Socket(object):
                 break
 
     def recv(self, maxbytes):
+        ''' Read data from socket. '''
         if self._closed:
             raise SocketCloseError()
          
@@ -258,17 +349,40 @@ class Socket(object):
         yield self.sock.recv(maxbytes)
 
     def close(self):
+        """ Immediately close the listening socket. """
         self._closed = True
         self.sock.close()
 
+def read(fd, bufsize=None, timeout=None):
+    ''' Read data from fd. If bufsize is None, read all data until eof.'''
+    if bufsize is None:
+        buf = []
+        while True:
+            data = yield read(fd, 1024, timeout)
+            print repr(data)
+            if not data:
+                break
+            buf.append(data)
+        yield ''.join(buf)
+    else:
+        yield ReadWait(fd, timeout=timeout)
+        yield fd.read(bufsize)
+
+
+def main():
+    f = open('test.txt')
+    data = yield read(102323, 10)
+    print repr(data)
+
 
 class MyQueue(object):
+    pass
 
-
-def handle_client(client, addr):
-    print 'Connection from {}'.format(addr)
+def handle_client(client):
+    print 'Connection from {}'.format(client.addr)
     while True:
-        data = yield client.recv(1024)
+        data = yield client.readline()
+        print data,
         if not data:
             client.close()
             break
@@ -277,28 +391,28 @@ def handle_client(client, addr):
 
 def server(port):
     print "Server Porting..."
-    rawsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    rawsock.bind(('', port))
-    rawsock.listen(5)
-    sock = Socket(rawsock)
+    listener = Listener('', port, 5)
     while True:
-        client, addr = yield sock.accept()
-        yield NewTask(handle_client(client, addr))
-        
+        client = yield listener.accept()
+        yield NewTask(handle_client(client))
+
+
 if __name__ == '__main__':
-    # def divzero():
-    #     t = 10 / 0
-    #     yield t
+    def divzero():
+        t = 10 / 0
+        print '++++++'
+        yield t
 
-    # def mid():
-    #     yield divzero()
+    def mid():
+        yield divzero()
 
-    # def printer():
-    #     for i in range(4):
-    #         print i
-    #         yield
-    #     yield mid()
-
+    def printer():
+        for i in range(4):
+            print i
+            yield
+        yield mid()
     sched = Scheduler()
     sched.new(server(8000))
+    # sched.new(main())
+    # sched.new(printer())
     sched.mainloop()
