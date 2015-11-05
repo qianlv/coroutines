@@ -3,10 +3,8 @@
 import select
 import types
 import sys
-import os
 import socket
 import errno
-from itertools import chain
 from Queue import Queue
 
 
@@ -250,7 +248,7 @@ class Listener(object):
         self.sock = self._listen(queuesize)
         if self.sock is None:
             raise SocketListenError()
-    
+
     def _listen(self, queuesize):
         ''' Get socket. '''
         addrinfo = socket.getaddrinfo(
@@ -279,7 +277,7 @@ class Listener(object):
         if sock:
             sock.listen(queuesize)
         return sock
-    
+
     def accept(self):
         """ Accept a new socket connection, Return a Connection Object. """
         if self._closed:
@@ -331,7 +329,7 @@ class Connection(object):
                 line += terminator
                 yield line
                 break
-            data =  yield self.recv(bufsize)
+            data = yield self.recv(bufsize)
             if data:
                 self._buf += data
             else:
@@ -344,7 +342,7 @@ class Connection(object):
         ''' Read data from socket. '''
         if self._closed:
             raise SocketCloseError()
-         
+
         yield ReadWait(self.sock)
         yield self.sock.recv(maxbytes)
 
@@ -352,6 +350,7 @@ class Connection(object):
         """ Immediately close the listening socket. """
         self._closed = True
         self.sock.close()
+
 
 def read(fd, bufsize=None, timeout=None):
     ''' Read data from fd. If bufsize is None, read all data until eof.'''
@@ -371,12 +370,13 @@ def read(fd, bufsize=None, timeout=None):
 
 def main():
     f = open('test.txt')
-    data = yield read(102323, 10)
+    data = yield read(f, 10)
     print repr(data)
 
 
 class MyQueue(object):
     pass
+
 
 def handle_client(client):
     print 'Connection from {}'.format(client.addr)
