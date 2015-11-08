@@ -4,7 +4,9 @@ import select
 import types
 import sys
 import socket
+import time
 import errno
+import heapq
 from Queue import Queue
 
 
@@ -26,18 +28,18 @@ class Task(object):
         while True:
             try:
                 if self.exc_info:
-                    self.target.throw(*self.exc_info)
+                    exc_info, self.exc_info = self.exc_info, None
+                    result = self.target.throw(*exc_info)
                 else:
                     result = self.target.send(self.sendval)
-                # print '----------------------'
-                # print self.target, '+', self.sendval, '+', repr(result)
-                # print '----------------------'
             except StopIteration:
+                # 正常结束
                 if not self.stack:
                     raise
                 self.sendval = None
                 self.target = self.stack.pop()
             except:
+                # 异常捕获，异常一层层向上抛
                 if not self.stack:
                     raise
                 self.exc_info = sys.exc_info()
@@ -66,21 +68,40 @@ class Scheduler(object):
         self.ready = Queue()
         self.taskmap = {}
         self.exit_waiting = {}  # tid: [task0, task1], tid为被等待退出Task的id, 列表为等待的Task
-        self.read_waiting = {}
-        self.write_waiting = {}
+        self._read_waiting = {}
+        self._write_waiting = {}
+        self._timeouts = [] 
 
     # I/O wait
     def waitforread(self, task, fd):
-        self.read_waiting[fd] = task
+        self._read_waiting[fd] = task
 
     def waitforwrite(self, task, fd):
-        self.write_waiting[fd] = task
+        self._write_waiting[fd] = task
+
+    def has_runable(self):
+        '''
+        Return True if there are runable tasks in ready queue, else return False.
+        '''
+        return not self.ready.empty()
+    
+    def has_io_waits(self):
+        '''
+        Return True if there are tasks waiting for I/O, else return False.
+        '''
+        return bool(self._read_waiting or self._write_waiting)
+    
+    def has_timouts(self):
+        '''
+        Return True if there are tasks with pending timouts, else return False.
+        '''
+        return bool(self._timeouts)
 
     def iopoll(self, timeout):
-        if self.read_waiting or self.write_waiting:
+        if self.has_io_waits():
             try:
-                rlist, wlist, elist = select.select(self.read_waiting,
-                                                    self.write_waiting,
+                rlist, wlist, elist = select.select(self._read_waiting,
+                                                    self._write_waiting,
                                                     [], timeout)
             except (TypeError, ValueError):
                 self._remove_bad_file_descriptors()
@@ -93,34 +114,57 @@ class Scheduler(object):
                     raise
             else:
                 for fd in rlist:
-                    self.schedule(self.read_waiting.pop(fd))
+                    self.schedule(self._read_waiting.pop(fd))
                 for fd in wlist:
-                    self.schedule(self.write_waiting.pop(fd))
+                    self.schedule(self._write_waiting.pop(fd))
 
     def _remove_bad_file_descriptors(self):
-        for fd in set(self.read_waiting):
+        for fd in set(self._read_waiting):
             try:
                 select.select([fd], [fd], [fd], 0)
             except:
-                task = self.read_waiting.pop(fd)
+                task = self._read_waiting.pop(fd)
                 task.exc_info = sys.exc_info()
                 self.schedule(task)
 
-        for fd in set(self.write_waiting):
+        for fd in set(self._write_waiting):
             try:
                 select.select([fd], [fd], [fd], 0)
             except:
-                task = self.write_waiting.pop(fd)
+                task = self._write_waiting.pop(fd)
                 task.exc_info = sys.exc_info()
                 self.schedule(task)
 
-    def iotask(self):
+    def io_and_timeout_task(self):
         while True:
-            if self.ready.empty():
-                self.iopoll(None)
-            else:
-                self.iopoll(0)
+            self.iopoll(self._fix_timeout(None))
+            self.handle_timeout(self._fix_timeout(None))
             yield
+
+    def _fix_timeout(self, timeout):
+        if not self.ready.empty():
+            timout = 0.0
+        elif self.has_timouts(): 
+            expiration_timeout = max(0.0,  self._timeouts[0][0] - time.time())
+            if timeout is None or timeout > expiration_timeout:
+                timeout = expiration_timeout
+        return timeout
+
+    def _add_timeout(self, result):
+        heapq.heappush(self._timeouts, (result.expiration, result))
+
+    def _remove_timeout(self, result):
+        self._timeouts.remove((result.expiration, result))
+        heapq.heapify(self._timeouts)
+
+    def handle_timeout(self, timeout): 
+        if not self.has_runable() and timeout > 0.0:
+            time.sleep(timout)
+
+        current_time = time.time()
+        while self._timeouts and self._timeouts[0][0] <= current_time:
+            result = heapq.heappop(self._timeouts)[1]
+            result.handle_expiration()
 
     def new(self, target):
         newtask = Task(target)
@@ -132,7 +176,7 @@ class Scheduler(object):
         self.ready.put(task)
 
     def mainloop(self):
-        self.new(self.iotask())
+        self.new(self.io_and_timeout_task())
         while self.taskmap:
             task = self.ready.get()
             try:
@@ -163,8 +207,16 @@ class Scheduler(object):
 
 
 class SystemCall(object):
+    def __init__(self, timeout=None):
+        if timeout is not None:
+            self.expiration = time.time() + float(timeout)
+            print repr(self.expiration)
+    
+    def expires(self):
+        return (self.expiration is not None)
+
     def handle(self):
-        pass
+        raise NotImplemented
 
 
 class GetTid(SystemCall):
@@ -174,7 +226,8 @@ class GetTid(SystemCall):
 
 
 class NewTask(SystemCall):
-    def __init__(self, target):
+    def __init__(self, target, timeout=None):
+        super(NewTask, self).__init__(timeout=timeout)
         self.target = target
 
     def handle(self):
@@ -185,7 +238,8 @@ class NewTask(SystemCall):
 
 
 class KillTask(SystemCall):
-    def __init__(self, tid):
+    def __init__(self, tid, timeout=None):
+        super(NewTask, self).__init__(timeout=timeout)
         self.tid = tid
 
     def handle(self):
@@ -199,7 +253,8 @@ class KillTask(SystemCall):
 
 
 class WaitTask(SystemCall):
-    def __init__(self, tid):
+    def __init__(self, tid, timeout):
+        super(NewTask, self).__init__(timeout=timeout)
         self.tid = tid
 
     def handle(self):
@@ -215,20 +270,38 @@ def _is_file_descriptor(fd):
     return isinstance(fd, (int, long))
 
 
+class Timeout(Exception):
+    pass
+
+
 class ReadWait(SystemCall):
     def __init__(self, fd, timeout=None):
+        super(ReadWait, self).__init__(timeout=timeout)
         self.fd = fd if _is_file_descriptor(fd) else fd.fileno()
 
     def handle(self):
         self.sched.waitforread(self.task, self.fd)
+        if self.expires():
+            self.sched._add_timeout(self)
+
+    def handle_expiration(self):
+        self.sched.schedule(self.sched._read_waiting.pop(self.fd))
+        self.task.exc_info = (Timeout, )
 
 
 class WriteWait(SystemCall):
     def __init__(self, fd):
+        super(WriteWait, self).__init__(timeout=timeout)
         self.fd = fd if _is_file_descriptor(fd) else fd.fileno()
 
     def handle(self):
         self.sched.waitforwrite(self.task, self.fd)
+        if self.expires():
+            self.sched._add_timeout(self)
+
+    def handle_expiration(self):
+        self.sched.schedule(self.sched._read_waiting.pop(self.fd))
+        self.task.exc_info = (Timeout, )
 
 
 class SocketCloseError(Exception):
@@ -369,9 +442,11 @@ def read(fd, bufsize=None, timeout=None):
 
 
 def main():
-    f = open('test.txt')
-    data = yield read(f, 10)
-    print repr(data)
+    try:
+        data = yield read(sys.stdin, 10, timeout=3)
+    except:
+        pass
+    print 'pass'
 
 
 class MyQueue(object):
@@ -400,19 +475,22 @@ def server(port):
 if __name__ == '__main__':
     def divzero():
         t = 10 / 0
-        print '++++++'
         yield t
 
     def mid():
-        yield divzero()
+        try:
+            yield divzero()
+        except:
+            pass
 
     def printer():
         for i in range(4):
             print i
             yield
         yield mid()
+        print 'what'
     sched = Scheduler()
-    sched.new(server(8000))
-    # sched.new(main())
+    # sched.new(server(8000))
+    sched.new(main())
     # sched.new(printer())
     sched.mainloop()
