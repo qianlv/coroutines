@@ -27,27 +27,26 @@ Scheduler调度多个任务, 当任务(Task)执行阻塞操作时，如I/O操作
 
 一个简单处理多个客户端连接的服务器.
 
-    def handle_client(client):
-        print 'Connection from {}'.format(client.addr)
-        while True:
-            data = yield client.readline()
-            print data,
-            if not data:
-                client.close()
-                break
-            yield client.sendall(data)
+    >>> def handle_client(client):
+    ...     print 'Connection from {}'.format(client.addr)
+    ...     while True:
+    ...         data = yield client.readline()
+    ...         print data,
+    ...         if not data:
+    ...             client.close()
+    ...             break
+    ...         yield client.sendall(data)
 
+    >>> def server(port):
+    ...     print "Server Porting..."
+    ...     listener = Listener('', port, 5)
+    ...     while True:
+    ...         client = yield listener.accept()
+    ...         yield NewTask(handle_client(client))
 
-    def server(port):
-        print "Server Porting..."
-        listener = Listener('', port, 5)
-        while True:
-            client = yield listener.accept()
-            yield NewTask(handle_client(client))
-
-    sched = Scheduler()
-    sched.new(server(8000))
-    sched.mainloop()
+    >>> sched = Scheduler()
+    >>> sched.new(server(8000))
+    >>> sched.mainloop()
 
 Task中yield表达式的子函数中也可以使用yield表达式.
 在子函数运行到完成或异常抛出. 子函数结果(output)将
@@ -326,6 +325,10 @@ class Scheduler(object):
 
 
 class SystemCall(object):
+    pass
+
+
+class Condition(SystemCall):
     def __init__(self, timeout=None):
         '''
         如果timeout是None, task将被永远的挂起直达条件被满足.
@@ -357,8 +360,7 @@ class NewTask(SystemCall):
     '''
     创建一个新Task.
     '''
-    def __init__(self, target, timeout=None):
-        super(NewTask, self).__init__(timeout=timeout)
+    def __init__(self, target):
         self.target = target
 
     def handle(self):
@@ -372,7 +374,6 @@ class KillTask(SystemCall):
     杀死指定tid的Task.
     '''
     def __init__(self, tid, timeout=None):
-        super(NewTask, self).__init__(timeout=timeout)
         self.tid = tid
 
     def handle(self):
@@ -385,9 +386,9 @@ class KillTask(SystemCall):
         self.sched.schedule(self.task)
 
 
-class WaitTask(SystemCall):
+class WaitTask(Condition):
     '''
-    等待指定tid的Task完成.
+    如果Task任务yield这个类的实例将阻塞到指定的tid的Task完成.
     '''
     def __init__(self, tid, timeout=None):
         super(NewTask, self).__init__(timeout=timeout)
@@ -412,62 +413,93 @@ class Timeout(Exception):
     pass
 
 
-class ReadWait(SystemCall):
+class FDReady(Condition):
     '''
-    如果Task任务yield这个类的实例将阻塞到指定的文件描述符(fd)可读.
+
+    任务(Task) yield 这个类的实例将被挂起直到fd变为准备好进行I/O操作.
+
     '''
-    def __init__(self, fd, timeout=None):
+
+    def __init__(self, fd, read=False, write=False, exc=False, timeout=None):
         '''
+
         当fd可读或超时时，任务将重新可运行.
         fd可以是任意可以被select.select接受的对象.
         由于fd引起的异常，将被重新抛出在Task中.
         
         如果timeout不是None, 那么在timeout时间范围内,
-        fd还是不可读,Timeout异常将被抛出.
-        '''
-        super(ReadWait, self).__init__(timeout=timeout)
-        self.fd = fd if _is_file_descriptor(fd) else fd.fileno()
+        fd还是不可以进行I/O操作, Timeout异常将被抛出.
 
-    def handle(self):
+        '''
+
+        super(FDReady, self).__init__(timeout)
+
+        if not (read or write or exc):
+            raise ValueError("'read', 'write' and 'exc' cannot all be False.")
+
+        self.fd = fd if _is_file_descriptor(fd) else fd.fileno()
+        self.read = read
+        self.write = write
+        self.exc = exc
+
+    def fileno(self):
+        return self.fd
+
+    def _handle_read(self):
         self.sched.waitforread(self.task, self)
         if self.expires():
             self.sched._add_timeout(self)
 
-    def handle_expiration(self):
-        self.sched.remove_read_waiting(self, (Timeout, ))
-
-    def fileno(self):
-        return self.fd
-
-
-class WriteWait(SystemCall):
-    '''
-    如果Task任务yield这个类的实例将阻塞到指定的文件描述符(fd)可写.
-    '''
-    def __init__(self, fd, timeout=None):
-        '''
-        当fd可写或超时时，任务将重新可运行.
-        fd可以是任意可以被select.select接受的对象.
-        由于fd引起的异常，将被重新抛出在Task中.
-        
-        如果timeout不是None, 那么在timeout时间范围内,
-        fd还是不可写,Timeout异常将被抛出.
-        '''
-        super(WriteWait, self).__init__(timeout=timeout)
-        self.fd = fd if _is_file_descriptor(fd) else fd.fileno()
-
-    def handle(self):
+    def _handle_write(self):
         self.sched.waitforwrite(self.task, self)
         if self.expires():
             self.sched._add_timeout(self)
 
+    def handle(self):
+        if self.read:
+            self._handle_read()
+        elif self.write:
+            self._handle_write()
+
     def handle_expiration(self):
-        self.sched.remove_write_waiting(self, (Timeout, ))
+        if self.read:
+            self.sched.remove_read_waiting(self, (Timeout, ))
+        elif self.write:
+            self.sched.remove_write_waiting(self, (Timeout, ))
+            
 
-    def fileno(self):
-        return self.fd
+def readwait(fd, timeout=None):
+    '''
 
-class Sleep(SystemCall):
+    如果Task任务yield这个类的实例将阻塞到指定的文件描述符(fd)可读.
+
+        >>> try:
+        ...     yield readwait(fd, timeout=5)
+        ... except Timeout:
+        ...     print 'Timeout'
+        ... yield fd.read(100)
+
+    '''
+
+    return FDReady(fd, read=True, timeout=timeout)
+
+
+def writewait(fd, timeout):
+    '''
+    如果Task任务yield这个类的实例将阻塞到指定的文件描述符(fd)可写.
+        
+        >>> try:
+        ...     yield writewait(fd, timeout=5)
+        ... except Timeout:
+        ...     print 'Timeout'
+        ... yield fd.write(data)
+            
+    '''
+
+    return FDReady(fd, write=True, timeout=timeout)
+
+
+class Sleep(Condition):
     '''
 
     Task等待指定时间后，重新运行.
@@ -537,7 +569,7 @@ class Listener(object):
         """ Accept a new socket connection, Return a Connection Object. """
         if self._closed:
             raise SocketCloseError()
-        yield ReadWait(self.sock)
+        yield readwait(self.sock)
         client, addr = self.sock.accept()
         yield Connection(client, addr)
 
@@ -561,7 +593,7 @@ class Connection(object):
         if self._closed:
             raise SocketCloseError()
         if buffer:
-            yield WriteWait(self.sock)
+            yield writewait(self.sock)
             len = self.sock.send(buffer)
             yield len
 
@@ -571,7 +603,7 @@ class Connection(object):
             raise SocketCloseError()
 
         if buffer:
-            yield WriteWait(self.sock)
+            yield writewait(self.sock)
             self.sock.sendall(buffer)
 
     def readline(self, terminator="\n", bufsize=1024):
@@ -598,7 +630,7 @@ class Connection(object):
         if self._closed:
             raise SocketCloseError()
 
-        yield ReadWait(self.sock)
+        yield readwait(self.sock)
         yield self.sock.recv(maxbytes)
 
     def close(self):
@@ -619,7 +651,7 @@ def read(fd, bufsize=None, timeout=None):
             buf.append(data)
         yield ''.join(buf)
     else:
-        yield ReadWait(fd, timeout=timeout)
+        yield readwait(fd, timeout=timeout)
         yield fd.read(bufsize)
 
 
