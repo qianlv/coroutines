@@ -1,5 +1,92 @@
 # encoding=utf-8
 
+"""
+
+多任务协调和异步I/O通过使用生成器(generators).
+
+Scheduler调度多个任务, 当任务(Task)执行阻塞操作时，如I/O操作, 
+从某个队列中获取数据, Scheduler将暂时挂起这个Task,并且当阻塞
+操作完成时，Task任务将被重新启动.
+使用select或多线程也能实现并行任务.
+
+无关任务并行的例子:
+    
+    >>> def printer(msg):
+    ...     while True:
+    ...         print msg
+    ...         yiled
+    >>> sched = Scheduler()
+    >>> sched.new(printer('first'))
+    >>> sched.new(printer('second'))
+    >>> sched.mainloop()
+    first
+    second
+    first
+    second
+    ... 
+
+一个简单处理多个客户端连接的服务器.
+
+    def handle_client(client):
+        print 'Connection from {}'.format(client.addr)
+        while True:
+            data = yield client.readline()
+            print data,
+            if not data:
+                client.close()
+                break
+            yield client.sendall(data)
+
+
+    def server(port):
+        print "Server Porting..."
+        listener = Listener('', port, 5)
+        while True:
+            client = yield listener.accept()
+            yield NewTask(handle_client(client))
+
+    sched = Scheduler()
+    sched.new(server(8000))
+    sched.mainloop()
+
+Task中yield表达式的子函数中也可以使用yield表达式.
+在子函数运行到完成或异常抛出. 子函数结果(output)将
+传递到父函数, 异常将层层往上传递.
+
+    >>> def one():
+    ...    yield
+    ...
+    >>> def two():
+    ...     yield
+    ...     raise StopIteration(2)
+    ...
+    >>> def three():
+    ...     yield
+    ...     raise StopIteration((1, 2))
+    ...
+    >>> def raise_exception():
+    ...     yield
+    ...     raise RuntimeError('run error')
+    ...
+    >>> def all():
+    ...     print (yield one())
+    ...     print (yield two())
+    ...     print (yield three())
+    ...     try:
+    ...         yield raise_exception()
+    ...     except Exception as err:
+    ...         print err
+    ...
+    >>> sched = Scheduler()
+    >>> sched.new(all())
+    >>> sched.mainloop()
+    None
+    2
+    (1, 2)
+    run error
+
+"""
+
 import select
 import types
 import sys
@@ -7,6 +94,8 @@ import socket
 import time
 import errno
 import heapq
+from collections import defaultdict
+from functools import partial
 from Queue import Queue
 
 
@@ -32,11 +121,17 @@ class Task(object):
                     result = self.target.throw(*exc_info)
                 else:
                     result = self.target.send(self.sendval)
-            except StopIteration:
+            except StopIteration as err:
                 # 正常结束
                 if not self.stack:
                     raise
-                self.sendval = None
+                # 这里是否需要返回StopIteration的参数?
+                if not err.args:
+                    self.sendval = result
+                elif len(err.args) == 1:
+                    self.sendval = err.args[0]
+                else:
+                    self.sendval = err
                 self.target = self.stack.pop()
             except:
                 # 异常捕获，异常一层层向上抛
@@ -55,7 +150,6 @@ class Task(object):
                     if not self.stack:
                         return
                     self.sendval = result
-                    self.target = self.stack.pop()
 
     def __str__(self):
         return 'Task {} {}'.format(self.tid, str(self.target))
@@ -64,6 +158,9 @@ class Task(object):
 
 
 class Scheduler(object):
+    '''
+    多任务调度管理器.
+    '''
     def __init__(self):
         self.ready = Queue()
         self.taskmap = {}
@@ -98,6 +195,10 @@ class Scheduler(object):
         return bool(self._timeouts)
 
     def iopoll(self, timeout):
+        '''
+        检查是否有fd可以进行I/O, 并且等待此fd的Task重新加入到任务队列(ready),
+        如果此fd有timeout限制, 那么同时那fd移除timeout列表.
+        '''
         if self.has_io_waits():
             try:
                 rlist, wlist, elist = select.select(self._read_waiting,
@@ -113,29 +214,38 @@ class Scheduler(object):
                 else:
                     raise
             else:
-                for fd in rlist:
-                    self.schedule(self._read_waiting.pop(fd))
-                for fd in wlist:
-                    self.schedule(self._write_waiting.pop(fd))
-
+                map(self.remove_read_waiting, rlist)
+                map(self._remove_timeout, [fd for fd in rlist if fd.expires()])
+                map(self.remove_write_waiting, wlist)
+                map(self._remove_timeout, [fd for fd in wlist if fd.expires()])
+    
     def _remove_bad_file_descriptors(self):
         for fd in set(self._read_waiting):
             try:
                 select.select([fd], [fd], [fd], 0)
             except:
-                task = self._read_waiting.pop(fd)
-                task.exc_info = sys.exc_info()
-                self.schedule(task)
+                self.remove_read_waiting(fd, sys.exc_info())
 
         for fd in set(self._write_waiting):
             try:
                 select.select([fd], [fd], [fd], 0)
             except:
-                task = self._write_waiting.pop(fd)
-                task.exc_info = sys.exc_info()
-                self.schedule(task)
+                self.remove_write_waiting(fd, sys.exc_info())
+
+    def remove_write_waiting(self, fd, exc_info=None):
+        task = self._write_waiting.pop(fd)
+        task.exc_info = exc_info
+        self.schedule(task)
+
+    def remove_read_waiting(self, fd, exc_info=None):
+        task = self._read_waiting.pop(fd)
+        task.exc_info = exc_info
+        self.schedule(task)
 
     def io_and_timeout_task(self):
+        '''
+        I/O 任务处理, 任务超时处理。
+        '''
         while True:
             self.iopoll(self._fix_timeout(None))
             self.handle_timeout(self._fix_timeout(None))
@@ -158,13 +268,19 @@ class Scheduler(object):
         heapq.heapify(self._timeouts)
 
     def handle_timeout(self, timeout): 
+        '''
+        处理超时的任务, 并抛出Timeout异常.
+        '''
         if not self.has_runable() and timeout > 0.0:
-            time.sleep(timout)
+            time.sleep(timeout)
 
         current_time = time.time()
         while self._timeouts and self._timeouts[0][0] <= current_time:
             result = heapq.heappop(self._timeouts)[1]
-            result.handle_expiration()
+            if isinstance(result, Sleep): 
+                self.schedule(result.task)        
+            else:
+                result.handle_expiration()
 
     def new(self, target):
         newtask = Task(target)
@@ -176,6 +292,9 @@ class Scheduler(object):
         self.ready.put(task)
 
     def mainloop(self):
+        '''
+        主循环
+        '''
         self.new(self.io_and_timeout_task())
         while self.taskmap:
             task = self.ready.get()
@@ -208,6 +327,12 @@ class Scheduler(object):
 
 class SystemCall(object):
     def __init__(self, timeout=None):
+        '''
+        如果timeout是None, task将被永远的挂起直达条件被满足.
+        否则, 如果在timeout时间范围内条件未满足则Timeout异常
+        将被抛出.
+        '''
+        self.expiration = None
         if timeout is not None:
             self.expiration = time.time() + float(timeout)
             print repr(self.expiration)
@@ -220,24 +345,32 @@ class SystemCall(object):
 
 
 class GetTid(SystemCall):
+    '''
+    获取Task Id 
+    '''
     def handle(self):
         self.task.sendval = self.task.tid
         self.sched.schedule(self.task)
 
 
 class NewTask(SystemCall):
+    '''
+    创建一个新Task.
+    '''
     def __init__(self, target, timeout=None):
         super(NewTask, self).__init__(timeout=timeout)
         self.target = target
 
     def handle(self):
         tid = self.sched.new(self.target)
-        # print 'New Task', tid, self.task
         self.task.sendval = tid
         self.sched.schedule(self.task)
 
 
 class KillTask(SystemCall):
+    '''
+    杀死指定tid的Task.
+    '''
     def __init__(self, tid, timeout=None):
         super(NewTask, self).__init__(timeout=timeout)
         self.tid = tid
@@ -253,7 +386,10 @@ class KillTask(SystemCall):
 
 
 class WaitTask(SystemCall):
-    def __init__(self, tid, timeout):
+    '''
+    等待指定tid的Task完成.
+    '''
+    def __init__(self, tid, timeout=None):
         super(NewTask, self).__init__(timeout=timeout)
         self.tid = tid
 
@@ -264,6 +400,8 @@ class WaitTask(SystemCall):
         # return immediately without waiting.
         if not result:
             self.sched.schedule(self.task)
+        if result and self.expires():
+            self.sched._add_timeout(self)
 
 
 def _is_file_descriptor(fd):
@@ -275,33 +413,77 @@ class Timeout(Exception):
 
 
 class ReadWait(SystemCall):
+    '''
+    如果Task任务yield这个类的实例将阻塞到指定的文件描述符(fd)可读.
+    '''
     def __init__(self, fd, timeout=None):
+        '''
+        当fd可读或超时时，任务将重新可运行.
+        fd可以是任意可以被select.select接受的对象.
+        由于fd引起的异常，将被重新抛出在Task中.
+        
+        如果timeout不是None, 那么在timeout时间范围内,
+        fd还是不可读,Timeout异常将被抛出.
+        '''
         super(ReadWait, self).__init__(timeout=timeout)
         self.fd = fd if _is_file_descriptor(fd) else fd.fileno()
 
     def handle(self):
-        self.sched.waitforread(self.task, self.fd)
+        self.sched.waitforread(self.task, self)
         if self.expires():
             self.sched._add_timeout(self)
 
     def handle_expiration(self):
-        self.sched.schedule(self.sched._read_waiting.pop(self.fd))
-        self.task.exc_info = (Timeout, )
+        self.sched.remove_read_waiting(self, (Timeout, ))
+
+    def fileno(self):
+        return self.fd
 
 
 class WriteWait(SystemCall):
-    def __init__(self, fd):
+    '''
+    如果Task任务yield这个类的实例将阻塞到指定的文件描述符(fd)可写.
+    '''
+    def __init__(self, fd, timeout=None):
+        '''
+        当fd可写或超时时，任务将重新可运行.
+        fd可以是任意可以被select.select接受的对象.
+        由于fd引起的异常，将被重新抛出在Task中.
+        
+        如果timeout不是None, 那么在timeout时间范围内,
+        fd还是不可写,Timeout异常将被抛出.
+        '''
         super(WriteWait, self).__init__(timeout=timeout)
         self.fd = fd if _is_file_descriptor(fd) else fd.fileno()
 
     def handle(self):
-        self.sched.waitforwrite(self.task, self.fd)
+        self.sched.waitforwrite(self.task, self)
         if self.expires():
             self.sched._add_timeout(self)
 
     def handle_expiration(self):
-        self.sched.schedule(self.sched._read_waiting.pop(self.fd))
-        self.task.exc_info = (Timeout, )
+        self.sched.remove_write_waiting(self, (Timeout, ))
+
+    def fileno(self):
+        return self.fd
+
+class Sleep(SystemCall):
+    '''
+
+    Task等待指定时间后，重新运行.
+      
+      yield Sleep(10)
+      do_something()
+
+    '''
+    def __init__(self, seconds):
+        seconds = float(seconds)
+        if seconds < 0.0:
+            raise ValueError("'seconds' argument must be greater than 0")
+        super(Sleep, self).__init__(timeout=seconds)
+    
+    def handle(self):
+        self.sched._add_timeout(self)
 
 
 class SocketCloseError(Exception):
@@ -441,14 +623,6 @@ def read(fd, bufsize=None, timeout=None):
         yield fd.read(bufsize)
 
 
-def main():
-    try:
-        data = yield read(sys.stdin, 10, timeout=3)
-    except:
-        pass
-    print 'pass'
-
-
 class MyQueue(object):
     pass
 
@@ -472,6 +646,25 @@ def server(port):
         yield NewTask(handle_client(client))
 
 
+def main():
+    current = time.time()
+    yield Sleep(10)
+    print 'main sleep', time.time() - current
+    try:
+        data = yield read(sys.stdin, 10, timeout=1)
+    except:
+        print 'pass'
+
+
+def main2():
+    current = time.time()
+    yield Sleep(9.2)
+    print 'main sleep', time.time() - current
+    try:
+        data = yield read(sys.stdin, 100, timeout=2)
+    except:
+        print 'pass2'
+
 if __name__ == '__main__':
     def divzero():
         t = 10 / 0
@@ -490,7 +683,8 @@ if __name__ == '__main__':
         yield mid()
         print 'what'
     sched = Scheduler()
-    # sched.new(server(8000))
-    sched.new(main())
+    sched.new(server(8000))
+    # sched.new(main())
+    # sched.new(main2())
     # sched.new(printer())
     sched.mainloop()
