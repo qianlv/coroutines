@@ -233,12 +233,18 @@ class Scheduler(object):
 
     def remove_write_waiting(self, fd, exc_info=None):
         task = self._write_waiting.pop(fd)
-        task.exc_info = exc_info
+        if exc_info:
+            task.exc_info = exc_info
+        elif isinstance(fd, FDAction):
+            task.sendval = fd._eval()
         self.schedule(task)
 
     def remove_read_waiting(self, fd, exc_info=None):
         task = self._read_waiting.pop(fd)
-        task.exc_info = exc_info
+        if exc_info:
+            task.exc_info = exc_info
+        elif isinstance(fd, FDAction):
+            task.sendval = fd._eval()
         self.schedule(task)
 
     def io_and_timeout_task(self):
@@ -499,6 +505,36 @@ def writewait(fd, timeout):
     return FDReady(fd, write=True, timeout=timeout)
 
 
+class FDAction(FDReady):
+    def __init__(self, fd, func, args=(), kwargs={}, read=False, write=False, exc=False):
+        timeout = kwargs.pop('timeout', None)
+        super(FDAction, self).__init__(fd, read, write, exc, timeout)
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+
+    def handle(self):
+        super(FDAction, self).handle()
+
+    def _eval(self):
+        return self.func(*(self.args), **(self.kwargs))
+
+
+def read(fd, *args, **kwargs):
+    func = partial(os.read, fd) if _is_file_descriptor(fd) else fd.read
+    return FDAction(fd, func, args, kwargs, read=True)
+
+
+def readline(fd, *args, **kwargs):
+    func = partial(os.readline, fd) if _is_file_descriptor(fd) else fd.readline
+    return FDAction(fd, func, args, kwargs, read=True)
+
+
+def write(fd, *args, **kwargs):
+    func = partial(os.write, fd) if _is_file_descriptor(fd) else fd.write
+    return FDAction(fd, func, args, kwargs, write=True)
+
+
 class Sleep(Condition):
     '''
 
@@ -637,22 +673,6 @@ class Connection(object):
         """ Immediately close the listening socket. """
         self._closed = True
         self.sock.close()
-
-
-def read(fd, bufsize=None, timeout=None):
-    ''' Read data from fd. If bufsize is None, read all data until eof.'''
-    if bufsize is None:
-        buf = []
-        while True:
-            data = yield read(fd, 1024, timeout)
-            print repr(data)
-            if not data:
-                break
-            buf.append(data)
-        yield ''.join(buf)
-    else:
-        yield readwait(fd, timeout=timeout)
-        yield fd.read(bufsize)
 
 
 class MyQueue(object):
