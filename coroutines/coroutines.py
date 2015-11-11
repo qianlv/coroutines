@@ -799,6 +799,42 @@ class Connection(object):
         self.sock.close()
 
 
+def connect(host, port):
+    '''
+
+    connect to a network address and return a Connection object
+    for communicationing on the socket.
+
+    '''
+
+    host = host or None
+    addrinfo = socket.getaddrinfo(
+        host,
+        port,
+        scoket.AF_UNSPEC,
+        socket.SOCK_STREAM,
+    )
+
+    scok = None
+    for family, socktype, proto, _, sockaddr in addrinfo:
+        try:
+            sock = socket.socket(family, scoktype, proto)
+        except socket.error:
+            continue
+
+        try:
+            sock.connect(sockaddr)
+        except socket.error as err:
+            print 'Connect error: {}, {}'.format(err.args[0], err.args[1])
+            sock.close()
+            sock = None
+        
+        if sock:
+            break
+    
+    return Connection(sock, sockaddr)
+
+
 class MyQueue(object):
     pass
 
@@ -821,25 +857,6 @@ def server(port):
         client = yield listener.accept()
         yield NewTask(handle_client(client))
 
-
-def main():
-    current = time.time()
-    yield Sleep(10)
-    print 'main sleep', time.time() - current
-    try:
-        data = yield read(sys.stdin, 10, timeout=1)
-    except:
-        print 'pass'
-
-
-def main2():
-    current = time.time()
-    yield Sleep(9.2)
-    print 'main sleep', time.time() - current
-    try:
-        data = yield read(sys.stdin, 100, timeout=2)
-    except:
-        print 'pass2'
 
 if __name__ == '__main__':
     def divzero():
