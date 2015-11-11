@@ -4,13 +4,13 @@
 
 多任务协调和异步I/O通过使用生成器(generators).
 
-Scheduler调度多个任务, 当任务(Task)执行阻塞操作时，如I/O操作, 
+Scheduler调度多个任务, 当任务(Task)执行阻塞操作时，如I/O操作,
 从某个队列中获取数据, Scheduler将暂时挂起这个Task,并且当阻塞
 操作完成时，Task任务将被重新启动.
 使用select或多线程也能实现并行任务.
 
 无关任务并行的例子:
-    
+
     >>> def printer(msg):
     ...     while True:
     ...         print msg
@@ -23,7 +23,7 @@ Scheduler调度多个任务, 当任务(Task)执行阻塞操作时，如I/O操作
     second
     first
     second
-    ... 
+    ...
 
 一个简单处理多个客户端连接的服务器.
 
@@ -93,7 +93,7 @@ import socket
 import time
 import errno
 import heapq
-from collections import defaultdict
+import os
 from functools import partial
 from Queue import Queue
 
@@ -166,7 +166,7 @@ class Scheduler(object):
         self.exit_waiting = {}  # tid: [task0, task1], tid为被等待退出Task的id, 列表为等待的Task
         self._read_waiting = {}
         self._write_waiting = {}
-        self._timeouts = [] 
+        self._timeouts = []
 
     # I/O wait
     def waitforread(self, task, fd):
@@ -180,13 +180,13 @@ class Scheduler(object):
         Return True if there are runable tasks in ready queue, else return False.
         '''
         return not self.ready.empty()
-    
+
     def has_io_waits(self):
         '''
         Return True if there are tasks waiting for I/O, else return False.
         '''
         return bool(self._read_waiting or self._write_waiting)
-    
+
     def has_timouts(self):
         '''
         Return True if there are tasks with pending timouts, else return False.
@@ -217,7 +217,7 @@ class Scheduler(object):
                 map(self._remove_timeout, [fd for fd in rlist if fd.expires()])
                 map(self.remove_write_waiting, wlist)
                 map(self._remove_timeout, [fd for fd in wlist if fd.expires()])
-    
+
     def _remove_bad_file_descriptors(self):
         for fd in set(self._read_waiting):
             try:
@@ -258,8 +258,8 @@ class Scheduler(object):
 
     def _fix_timeout(self, timeout):
         if not self.ready.empty():
-            timout = 0.0
-        elif self.has_timouts(): 
+            timeout = 0.0
+        elif self.has_timouts():
             expiration_timeout = max(0.0,  self._timeouts[0][0] - time.time())
             if timeout is None or timeout > expiration_timeout:
                 timeout = expiration_timeout
@@ -272,7 +272,7 @@ class Scheduler(object):
         self._timeouts.remove((result.expiration, result))
         heapq.heapify(self._timeouts)
 
-    def handle_timeout(self, timeout): 
+    def handle_timeout(self, timeout):
         '''
         处理超时的任务, 并抛出Timeout异常.
         '''
@@ -282,8 +282,8 @@ class Scheduler(object):
         current_time = time.time()
         while self._timeouts and self._timeouts[0][0] <= current_time:
             result = heapq.heappop(self._timeouts)[1]
-            if isinstance(result, Sleep): 
-                self.schedule(result.task)        
+            if isinstance(result, Sleep):
+                self.schedule(result.task)
             else:
                 result.handle_expiration()
 
@@ -345,7 +345,7 @@ class Condition(SystemCall):
         if timeout is not None:
             self.expiration = time.time() + float(timeout)
             print repr(self.expiration)
-    
+
     def expires(self):
         return (self.expiration is not None)
 
@@ -353,9 +353,28 @@ class Condition(SystemCall):
         raise NotImplemented
 
 
+class Sleep(Condition):
+    '''
+
+    Task等待指定时间后，重新运行.
+
+      yield Sleep(10)
+      do_something()
+
+    '''
+    def __init__(self, seconds):
+        seconds = float(seconds)
+        if seconds < 0.0:
+            raise ValueError("'seconds' argument must be greater than 0")
+        super(Sleep, self).__init__(timeout=seconds)
+
+    def handle(self):
+        self.sched._add_timeout(self)
+
+
 class GetTid(SystemCall):
     '''
-    获取Task Id 
+    获取Task Id
     '''
     def handle(self):
         self.task.sendval = self.task.tid
@@ -432,7 +451,7 @@ class FDReady(Condition):
         当fd可读或超时时，任务将重新可运行.
         fd可以是任意可以被select.select接受的对象.
         由于fd引起的异常，将被重新抛出在Task中.
-        
+
         如果timeout不是None, 那么在timeout时间范围内,
         fd还是不可以进行I/O操作, Timeout异常将被抛出.
 
@@ -472,7 +491,7 @@ class FDReady(Condition):
             self.sched.remove_read_waiting(self, (Timeout, ))
         elif self.write:
             self.sched.remove_write_waiting(self, (Timeout, ))
-            
+
 
 def readwait(fd, timeout=None):
     '''
@@ -493,13 +512,13 @@ def readwait(fd, timeout=None):
 def writewait(fd, timeout):
     '''
     如果Task任务yield这个类的实例将阻塞到指定的文件描述符(fd)可写.
-        
+
         >>> try:
         ...     yield writewait(fd, timeout=5)
         ... except Timeout:
         ...     print 'Timeout'
         ... yield fd.write(data)
-            
+
     '''
 
     return FDReady(fd, write=True, timeout=timeout)
@@ -521,37 +540,142 @@ class FDAction(FDReady):
 
 
 def read(fd, *args, **kwargs):
+    '''
+
+    当sock可以被读时, Task被重新运行.
+    如果timeout参数被设置, 那么timeout时间后,sock还不可写时, Timeout异常将抛出.
+    其他参数将传给(os.read 或 fd.read).
+
+        >>> try:
+        ...     data = (yield read(fd, timeout=5))
+        ... except Timeout:
+        ...     pass
+
+    '''
+
     func = partial(os.read, fd) if _is_file_descriptor(fd) else fd.read
     return FDAction(fd, func, args, kwargs, read=True)
 
 
 def readline(fd, *args, **kwargs):
+    '''
+
+    当sock可以被读时, Task被重新运行.
+    如果timeout参数被设置, 那么timeout时间后,sock还不可写时, Timeout异常将抛出.
+    其他参数将传给(os.readline 或 fd.readline).
+
+        >>> try:
+        ...     data = (yield readline(fd, timeout=5))
+        ... except Timeout:
+        ...     pass
+
+    '''
+
     func = partial(os.readline, fd) if _is_file_descriptor(fd) else fd.readline
     return FDAction(fd, func, args, kwargs, read=True)
 
 
 def write(fd, *args, **kwargs):
+    '''
+
+    当sock可以被读时, Task被重新运行.
+    如果timeout参数被设置, 那么timeout时间后,sock还不可写时, Timeout异常将抛出.
+    其他参数将传给(os.write 或 fd.write).
+
+        >>> try:
+        ...     nbytes = (yield write(fd, data, timeout=5))
+        ... except Timeout:
+        ...     pass
+
+    '''
+
     func = partial(os.write, fd) if _is_file_descriptor(fd) else fd.write
     return FDAction(fd, func, args, kwargs, write=True)
 
 
-class Sleep(Condition):
+def accept(sock, *args, **kwargs):
     '''
 
-    Task等待指定时间后，重新运行.
-      
-      yield Sleep(10)
-      do_something()
+    当sock可以被读时, Task被重新运行.
+    如果timeout参数被设置, 那么timeout时间后,sock还不可写时, Timeout异常将抛出.
+    其他参数将传给sock.accept.
+
+        >>> try:
+        ...     conn, address = (yield accept(sock, timeout=5))
+        ... except Timeout:
+        ...     pass
 
     '''
-    def __init__(self, seconds):
-        seconds = float(seconds)
-        if seconds < 0.0:
-            raise ValueError("'seconds' argument must be greater than 0")
-        super(Sleep, self).__init__(timeout=seconds)
-    
-    def handle(self):
-        self.sched._add_timeout(self)
+
+    return FDAction(sock, sock.accept, args, kwargs, read=True)
+
+
+def recv(sock, *args, **kwargs):
+    '''
+
+    当sock可以被读时, Task被重新运行.
+    如果timeout参数被设置, 那么timeout时间后,sock还不可写时, Timeout异常将抛出.
+    其他参数将传给sock.recv.
+
+        >>> try:
+        ...     data = (yield recv(sock, 1024, timeout=5))
+        ... except Timeout:
+        ...     pass
+
+    '''
+
+    return FDAction(sock, sock.recv, args, kwargs, read=True)
+
+
+def recvfrom(sock, *args, **kwargs):
+    '''
+
+    当sock可以被读时, Task被重新运行.
+    如果timeout参数被设置, 那么timeout时间后,sock还不可写时, Timeout异常将抛出.
+    其他参数将传给sock.recvfrom.
+
+        >>> try:
+        ...     data, address = (yield recvfrom(sock, 1024, timeout=5))
+        ... except Timeout:
+        ...     pass
+
+    '''
+
+    return FDAction(sock, sock.recvfrom, args, kwargs, read=True)
+
+
+def send(sock, *args, **kwargs):
+    '''
+
+    当sock可以被写时, Task被重新运行.
+    如果timeout参数被设置, 那么timeout时间后,sock还不可写时, Timeout异常将抛出.
+    其他参数将传给sock.send.
+
+        >>> try:
+        ...     nsent = (yield send(sock, data, timeout=5))
+        ... except Timeout:
+        ...     pass
+
+    '''
+
+    return FDAction(sock, sock.send, args, kwargs, write=True)
+
+
+def sendto(sock, *args, **kwargs):
+    '''
+
+    当sock可以被写时, Task被重新运行.
+    如果timeout参数被设置, 那么timeout时间后,sock还不可写时, Timeout异常将抛出.
+    其他参数将传给sock.sendto.
+
+        >>> try:
+        ...     nsent = (yield sendto(sock, data, address, timeout=5))
+        ... except Timeout:
+        ...     pass
+
+    '''
+
+    return FDAction(sock, sock.sendto, args, kwargs, write=True)
 
 
 class SocketCloseError(Exception):
